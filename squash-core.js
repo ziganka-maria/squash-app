@@ -19,12 +19,15 @@ const log = (s, e) => {
 };
 const noop = (s0, why) => { const s = clone(s0); s.last = { a: 'none', why }; return s; };
 
-// o: names [я, соперник], gamesToWin 1|2|3, firstServer 0|1, box 'R'|'L'
+// Сторона подачи (box: 'R' | 'L') известна только если её назвали: в начале гейма и после перехода подачи её выбирает
+// сам подающий, приложение этого не видит. Пока сторона не названа, box = null и boxFree = true;
+// «другую половину» после очка можно назвать только от известной стороны.
+// o: names [я, соперник], gamesToWin 1|2|3, firstServer 0|1, box 'R'|'L' (если сторона уже известна)
 Q.newMatch = (o = {}) => {
-  const first = o.firstServer === 1 ? 1 : 0;
+  const first = o.firstServer === 1 ? 1 : 0, box = o.box === 'L' || o.box === 'R' ? o.box : null;
   return {
     v: 1, names: o.names || ['Я', 'Соперник'], gamesToWin: o.gamesToWin || 2,
-    score: [0, 0], results: [], first, server: first, box: o.box === 'L' ? 'L' : 'R', boxFree: true,
+    score: [0, 0], results: [], first, server: first, box, boxFree: box === null,
     status: 'playing', // playing — идёт гейм, between — гейм закончен, ждём следующий, finished — матч закончен
     winner: null, last: null, log: [], past: []
   };
@@ -36,6 +39,13 @@ Q.games = s => s.results.reduce((g, r) => { g[r.winner]++; return g; }, [0, 0]);
 Q.gameWinner = sc => {
   const hi = sc[0] > sc[1] ? 0 : 1, a = sc[hi], b = sc[1 - hi];
   return a >= POINTS && a - b >= WIN_BY ? hi : null;
+};
+
+// бывает ли такой счёт в гейме: до 11 — любой; после 11 разница только 1 или 2
+Q.validScore = (a, b) => {
+  if (![a, b].every(n => Number.isInteger(n) && n >= 0 && n <= 99)) return false;
+  const hi = Math.max(a, b), lo = Math.min(a, b);
+  return hi <= POINTS || hi - lo <= WIN_BY;
 };
 
 // у кого сейчас гейм-бол / матч-бол
@@ -70,36 +80,40 @@ Q.point = (s0, who, kind = 'rally') => {
   s.score[who]++;
   s.last = { a: 'point', who, kind, handOut: !wasServer };
   s.server = who;
-  if (wasServer) { s.box = s.box === 'R' ? 'L' : 'R'; s.boxFree = false; } // подающий выиграл — подаёт с другой половины
-  else { s.box = 'R'; s.boxFree = true; } // переход подачи — новый подающий выбирает сторону сам
+  if (wasServer) { // подающий выиграл — подаёт с другой половины, если мы знаем, с какой подавал
+    if (s.box) s.box = s.box === 'R' ? 'L' : 'R';
+    s.boxFree = s.box === null;
+  } else { s.box = null; s.boxFree = true; } // переход подачи — новый подающий выбирает сторону сам
   const w = Q.gameWinner(s.score);
   if (w !== null) endGame(s, w);
   return s;
 };
 Q.stroke = (s, who) => Q.point(s, who, 'stroke');
 
-// let: переигровка, счёт и подача те же. no let: просьба отклонена, игра идёт дальше — очко само по себе не меняется,
-// розыгрыш запишут обычной командой «очко …»
-const call = a => s0 => {
+// let: переигровка, счёт и подача те же
+Q.let = s0 => {
   if (s0.status !== 'playing') return noop(s0, 'Сейчас гейм не идёт');
   const s = clone(s0);
-  log(s, { a });
-  s.last = { a };
+  log(s, { a: 'let' });
+  s.last = { a: 'let' };
   return s;
 };
-Q.let = call('let');
-Q.noLet = call('nolet');
+// no let: просьба отклонена — по разъяснениям PSA очко получает тот, кто НЕ просил; appellant — кто просил. Спорный пункт: см. вопросы подруге
+Q.noLet = (s, appellant) => Q.point(s, 1 - appellant, 'nolet');
+// ошибка подачи (правило 5.8): второй подачи нет, очко принимающему и переход подачи
+Q.fault = s => Q.point(s, 1 - s.server, 'fault');
 
-// исправление счёта текущего гейма; o.server — кто подаёт после исправления
+// исправление счёта текущего гейма; o.server — кто подаёт после исправления. Сторона подачи после исправления неизвестна
 Q.setScore = (s0, a, b, o = {}) => {
   if (s0.status !== 'playing') return noop(s0, 'Гейм уже закончен — отмените последнее очко');
-  if (![a, b].every(n => Number.isInteger(n) && n >= 0 && n <= 99)) return noop(s0, 'Не разобрал счёт');
+  if (!Q.validScore(a, b)) return noop(s0, 'Такого счёта в гейме не бывает');
   const s = clone(s0);
   const from = s.score.slice();
   log(s, { a: 'fix', from, to: [a, b] });
   s.last = { a: 'fix', from, to: [a, b] };
   s.score = [a, b];
-  if ((o.server === 0 || o.server === 1) && o.server !== s.server) { s.server = o.server; s.box = 'R'; s.boxFree = true; }
+  if (o.server === 0 || o.server === 1) s.server = o.server;
+  s.box = null; s.boxFree = true;
   const w = Q.gameWinner(s.score);
   if (w !== null) endGame(s, w);
   return s;
@@ -109,7 +123,7 @@ Q.setServer = (s0, p) => {
   if (s0.status !== 'playing') return noop(s0, 'Сейчас гейм не идёт');
   const s = clone(s0);
   log(s, { a: 'server', who: p });
-  s.server = p; s.box = 'R'; s.boxFree = true;
+  s.server = p; s.box = null; s.boxFree = true;
   s.last = { a: 'server', who: p };
   return s;
 };
@@ -129,7 +143,7 @@ Q.nextGame = (s0, first) => {
   const s = clone(s0);
   const f = first === 0 || first === 1 ? first : s.results[s.results.length - 1].winner;
   log(s, { a: 'next', first: f });
-  s.score = [0, 0]; s.first = f; s.server = f; s.box = 'R'; s.boxFree = true; s.status = 'playing';
+  s.score = [0, 0]; s.first = f; s.server = f; s.box = null; s.boxFree = true; s.status = 'playing';
   s.last = { a: 'next', first: f, n: s.results.length + 1 };
   return s;
 };
@@ -145,7 +159,13 @@ Q.undo = s0 => {
 };
 
 Q.query = s0 => { const s = clone(s0); s.last = { a: 'query' }; return s; };
+Q.queryServe = s0 => { const s = clone(s0); s.last = { a: 'serve' }; return s; };
 Q.confirm = s0 => { const s = clone(s0); s.last = { a: 'confirm' }; return s; };
+// не команда: ничего не меняем и не говорим (шум, разговор на корте)
+Q.ignore = s0 => { const s = clone(s0); s.last = { a: 'ignored' }; return s; };
+// вопрос игроку (подтвердить опасное исправление): q — текст вопроса
+Q.ask = (s0, q) => { const s = clone(s0); s.last = { a: 'ask', q }; return s; };
+Q.cancelled = s0 => { const s = clone(s0); s.last = { a: 'cancelled' }; return s; };
 
 // ——— что сказать вслух ———
 const NUMW = ['ноль', 'один', 'два', 'три', 'четыре', 'пять', 'шесть', 'семь', 'восемь', 'девять', 'десять', 'одиннадцать', 'двенадцать',
@@ -168,20 +188,23 @@ Q.say = s => {
   switch (l.a) {
     case 'point': {
       if (l.kind === 'stroke') out.push('Stroke, ' + nm(l.who) + '.');
+      if (l.kind === 'nolet') out.push('No let.');
+      if (l.kind === 'fault') out.push('Ошибка подачи.');
       if (l.gameEnded) {
+        // как у маркёра: сначала счёт, потом «гейм»
         const w = l.gameEnded.winner, sc = l.gameEnded.score, g = Q.games(s);
-        if (l.matchEnded) out.push('Матч — ' + nm(w) + '. По геймам ' + word(g[w]) + ', ' + word(g[1 - w]) + '.');
-        else out.push('Гейм — ' + nm(w) + '. ' + word(sc[w]) + ', ' + word(sc[1 - w]) + '. В матче ' + word(g[w]) + ', ' + word(g[1 - w]) + '.');
+        if (l.matchEnded) out.push(word(sc[w]) + ', ' + word(sc[1 - w]) + '. Матч — ' + nm(w) + '. По геймам ' + word(g[w]) + ', ' + word(g[1 - w]) + '.');
+        else out.push(word(sc[w]) + ', ' + word(sc[1 - w]) + '. Гейм — ' + nm(w) + '. В матче ' + word(g[w]) + ', ' + word(g[1 - w]) + '.');
         break;
       }
       if (l.handOut) out.push('Переход.');
       out.push(Q.scoreWords(s) + '.');
-      if (!s.boxFree) out.push('Подача ' + side(s.box) + '.');
+      if (s.score[0] === 10 && s.score[1] === 10) out.push('Играем до разницы в два очка.'); // правило 3.5.8
+      if (!s.boxFree) out.push('Подача ' + side(s.box) + '.'); // сторону называем, только если она известна
       out.push(ballWords(s));
       break;
     }
     case 'let': out.push('Переигровка.', Q.scoreWords(s) + '.'); break;
-    case 'nolet': out.push('No let. Играем.'); break;
     case 'fix':
       if (s.status === 'playing') out.push('Исправлено.', Q.scoreWords(s) + '.');
       else out.push('Исправлено. Гейм — ' + nm(s.results[s.results.length - 1].winner) + '.');
@@ -191,6 +214,11 @@ Q.say = s => {
     case 'box': out.push('Подача ' + side(l.box) + '.'); break;
     case 'next': out.push('Гейм ' + word(l.n) + '. Ноль, ноль. Подача — ' + nm(l.first) + '.'); break;
     case 'undo': out.push('Отмена.', s.status === 'playing' ? Q.scoreWords(s) + '.' : ''); break;
+    case 'serve':
+      // сторону выбирает сам подающий: в начале гейма и когда подача перешла к нему
+      if (s.status !== 'playing') out.push('Гейм не идёт.');
+      else out.push('Подача — ' + nm(s.server) + ', ' + (s.boxFree ? 'сторона не названа.' : side(s.box) + '.'));
+      break;
     case 'query': {
       const g = Q.games(s);
       out.push(Q.scoreWords(s) + '.', 'Подача — ' + nm(s.server) + (s.boxFree ? '' : ', ' + side(s.box)) + '.');
@@ -198,7 +226,10 @@ Q.say = s => {
       out.push(ballWords(s));
       break;
     }
+    case 'ask': out.push(l.q); break;
+    case 'cancelled': out.push('Хорошо, ничего не меняю.'); break;
     case 'none': out.push(l.why); break;
+    // ignored — молчим
   }
   return out.filter(Boolean).join(' ').replace(/(^|\. )([а-я])/g, (m, a, b) => a + b.toUpperCase());
 };

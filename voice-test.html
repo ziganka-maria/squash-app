@@ -39,7 +39,7 @@ textarea { width: 100%; height: 160px; font: 12px ui-monospace, Consolas, monosp
 </head>
 <body>
 <h1>Проверка голоса</h1>
-<p class="sub">Нажми кнопку, скажи фразу вслух и посмотри, что приложение услышало и поняло. Потом нажми «Скопировать отчёт» внизу и пришли мне.</p>
+<p class="sub">Версия 2. Нажми кнопку, скажи фразу вслух и посмотри, что приложение услышало и поняло. Потом нажми «Скопировать отчёт» внизу и пришли мне.</p>
 
 <div class="card">
   <h2>Что умеет это устройство</h2>
@@ -53,12 +53,14 @@ textarea { width: 100%; height: 160px; font: 12px ui-monospace, Consolas, monosp
     <label><input type="checkbox" id="tts" checked> озвучка</label>
   </div>
   <div class="heard" id="heard"><small>Тут появится услышанное</small></div>
+  <div class="ctl"><input id="typed" placeholder="Или продиктуйте с клавиатуры / напишите фразу" autocomplete="off" style="flex:1;max-width:none"><button id="send">Отправить</button></div>
 </div>
 
 <div class="card">
   <h2>Табло</h2>
   <div class="board" id="board"></div>
   <div class="state" id="state"></div>
+  <div class="ctl"><button id="boxR">Подача справа</button><button id="boxL">Подача слева</button></div>
   <div class="ctl">
     <input id="n0" value="Я" aria-label="Имя первого"><input id="n1" value="Соперник" aria-label="Имя второго">
     <select id="fmt" aria-label="Формат"><option value="1">1 гейм</option><option value="2" selected>до 2 побед</option><option value="3">до 3 побед</option></select>
@@ -101,8 +103,11 @@ const log = msg => {
 
 // ——— возможности устройства ———
 const ruVoices = () => hasTTS ? speechSynthesis.getVoices().filter(v => /^ru/i.test(v.lang)) : [];
+const standalone = () => matchMedia('(display-mode: standalone)').matches || navigator.standalone;
+const isApple = /iPhone|iPad|iPod/.test(navigator.userAgent);
 const features = () => [
   ['Распознавание речи', SR ? 'есть' : 'НЕТ', !SR],
+  ...(standalone() && isApple ? [['Важно для iPhone', 'в режиме «с экрана Домой» кнопка микрофона не слышит (известное ограничение Safari). Откройте страницу в Safari или диктуйте с клавиатуры в поле «Или продиктуйте»', true]] : []),
   ['Озвучка ответов', hasTTS ? 'есть' : 'НЕТ', !hasTTS],
   ['Русских голосов', ruVoices().length ? ruVoices().length + ' (' + ruVoices()[0].name + ')' : 'не найдено', hasTTS && !ruVoices().length],
   ['Защищённое соединение', window.isSecureContext ? 'да' : 'нет — микрофон не заработает', !window.isSecureContext],
@@ -124,7 +129,7 @@ const renderBoard = () => {
   const b = $('board'); b.innerHTML = '';
   [0, 1].forEach(p => {
     const n = document.createElement('div'); n.className = 'nm' + (st.server === p && st.status === 'playing' ? ' srv' : '');
-    n.textContent = (st.server === p && st.status === 'playing' ? '● ' : '') + st.names[p] + (st.server === p && st.status === 'playing' ? (st.boxFree ? ' — подача (сторону выбирает)' : ' — подача ' + Q.side(st.box)) : '');
+    n.textContent = (st.server === p && st.status === 'playing' ? '● ' : '') + st.names[p] + (st.server === p && st.status === 'playing' ? (st.boxFree ? ' — подача, сторона не названа' : ' — подача ' + Q.side(st.box)) : '');
     const s = document.createElement('div'); s.className = 'sc'; s.textContent = st.score[p];
     b.append(n, s);
   });
@@ -141,19 +146,25 @@ const describe = (c, s) => {
   switch (c.cmd) {
     case 'point': return 'очко — ' + n[c.who] + (c.claim ? ', назван счёт ' + c.claim.join(':') : '') + (c.handOut ? ', «переход»' : '');
     case 'stroke': return 'stroke — ' + (c.who === null ? 'кому — не названо' : n[c.who]);
-    case 'noLet': return 'no let — просьба отклонена, играем дальше';
+    case 'noLet': return 'no let — ' + (c.who === null ? 'кто просил, не сказано — переспрашиваем' : 'просил ' + n[c.who] + ', очко ' + n[1 - c.who]);
+    case 'fault': return 'ошибка подачи — очко принимающему, переход';
     case 'let': return 'let — переигровка';
     case 'score': return c.byPlayer ? 'счёт по игрокам ' + c.byPlayer.join(':') : 'счёт ' + c.claim.join(':');
     case 'undo': return 'отмена';
     case 'query': return 'спросили счёт';
+    case 'serve': return 'спросили, откуда подача';
     case 'next': return 'следующий гейм';
-    case 'handOut': return 'переход подачи';
+    case 'server': return 'подаёт — ' + n[c.who];
     case 'box': return 'сторона подачи — ' + Q.side(c.box);
-    default: return 'НЕ ПОНЯТО';
+    case 'ambig': return 'неясно (две команды или два игрока сразу) — переспрашиваем';
+    case 'yes': return 'ответ «да»';
+    case 'no': return 'ответ «нет»';
+    default: return 'не команда — ничего не изменено';
   }
 };
 
 // ——— озвучка ———
+let speakId = 0;
 const speak = text => {
   if (!$('tts').checked || !hasTTS || !text) return;
   const u = new SpeechSynthesisUtterance(text);
@@ -161,31 +172,48 @@ const speak = text => {
   const v = ruVoices()[0]; if (v) u.voice = v;
   // пока говорит приложение, микрофон не слушает — иначе оно услышит само себя
   speaking = true;
+  const id = ++speakId;
   if (active) try { rec.abort(); } catch (e) {}
-  const done = () => { speaking = false; if (want) setTimeout(startRec, 200); };
-  u.onend = done; u.onerror = done;
-  speechSynthesis.cancel(); speechSynthesis.speak(u);
+  let finished = false;
+  const done = why => {
+    if (finished) return;
+    finished = true; clearTimeout(wd);
+    log('озвучка: ' + why);
+    if (id !== speakId) return; // началась следующая фраза
+    speaking = false;
+    if (want) setTimeout(() => startRec(true), 200);
+  };
+  // на iPhone в режиме «с экрана Домой» конец озвучки мог не приходить — не даём ей навсегда выключить микрофон
+  const wd = setTimeout(() => done('таймаут, конец не пришёл'), 3000 + text.length * 90);
+  u.onstart = () => log('озвучка: началась');
+  u.onend = () => done('закончилась');
+  u.onerror = e => done('ошибка ' + (e && e.error));
+  if (speechSynthesis.speaking || speechSynthesis.pending) speechSynthesis.cancel();
+  speechSynthesis.speak(u);
 };
 
 // ——— услышанное ———
-const heard = (text, conf, typed) => {
+let pending = null; // исправление счёта, которое ждёт «да» или «нет»
+const heard = (text, conf, typed, label) => {
   if (!typed) stats.heard++;
-  const r = V.apply(st, text);
-  st = r.state;
-  const what = describe(r.cmd, st);
+  const r = V.apply(st, text, { pending });
+  st = r.state; pending = r.pending;
+  const what = describe(r.cmd, st) + (pending ? ' (ждёт «да» или «нет»)' : '');
   $('heard').innerHTML = '';
   const a = document.createElement('div'); a.textContent = '«' + text + '»';
-  const b = document.createElement('small'); b.textContent = 'Понято: ' + what + (r.say ? ' · Ответ: ' + r.say : '');
+  const b = document.createElement('small'); b.textContent = 'Понято: ' + what + (r.say ? ' · Ответ: ' + r.say : ' · молчим');
   $('heard').append(a, b);
-  log((typed ? 'нажато' : 'услышано') + ': «' + text + '»' + (conf ? ' (уверенность ' + (+conf).toFixed(2) + ')' : '') + ' → ' + what + ' → «' + r.say + '»');
+  log((label || (typed ? 'нажато' : 'услышано')) + ': «' + text + '»' + (conf ? ' (уверенность ' + (+conf).toFixed(2) + ')' : '') + ' → ' + what + ' → ' + (r.say ? '«' + r.say + '»' : 'молчим'));
   renderBoard();
-  speak(r.say);
+  if (r.say) speak(r.say); // непонятное молча игнорируем — иначе в постоянном режиме приложение будет отвечать на разговор на корте
 };
 
 // ——— микрофон ———
 const setBtn = () => { const on = active || want; $('mic').textContent = on ? '⏹ Остановить' : '🎤 Нажми и скажи'; $('mic').classList.toggle('on', on); };
-const startRec = () => {
-  if (!SR || speaking) return;
+const startRec = auto => {
+  if (!SR) return;
+  if (speaking) { log('микрофон ждёт: идёт озвучка'); return; }
+  if (auto) stats.restarts++;
   rec = new SR();
   rec.lang = 'ru-RU'; rec.interimResults = true; rec.continuous = $('cont').checked; rec.maxAlternatives = 1;
   rec.onstart = () => { active = true; t0 = Date.now(); stats.started++; setBtn(); log('микрофон включён'); };
@@ -205,7 +233,7 @@ const startRec = () => {
     active = false;
     const sec = (Date.now() - t0) / 1000; stats.longest = Math.max(stats.longest, sec);
     log('микрофон выключился через ' + sec.toFixed(1) + ' с');
-    if (want && !speaking) { stats.restarts++; setTimeout(() => { if (want && !speaking && !active) startRec(); }, 250); }
+    if (want && !speaking) setTimeout(() => { if (want && !speaking && !active) startRec(true); }, 250);
     setBtn();
   };
   try { rec.start(); } catch (e) { log('микрофон не запустился: ' + e.message); }
@@ -213,6 +241,9 @@ const startRec = () => {
 $('mic').onclick = () => {
   if (!SR) { log('в этом браузере нет распознавания речи'); return; }
   stats.pressed++;
+  log('нажатие: микрофон ' + (active ? 'включён' : 'выключен') + ', слушать постоянно: ' + (want ? 'да' : 'нет') + ', озвучка идёт: ' + (speaking ? 'да' : 'нет'));
+  // нажатие всегда сбрасывает озвучку: если она зависла, микрофон должен включиться
+  if (speaking) { speaking = false; speakId++; try { speechSynthesis.cancel(); } catch (e) {} }
   if (active || want) { want = false; try { rec.abort(); } catch (e) {} setBtn(); return; }
   want = $('cont').checked;
   startRec(); setBtn();
@@ -223,19 +254,28 @@ const newMatch = () => {
   st = Q.newMatch({ names: [$('n0').value.trim() || 'Я', $('n1').value.trim() || 'Соперник'], gamesToWin: +$('fmt').value, firstServer: +$('first').value });
   log('новый матч: ' + st.names.join(' — ') + ', до ' + st.gamesToWin + ' побед'); renderBoard();
 };
-$('reset').onclick = newMatch;
-['fmt', 'first'].forEach(id => $(id).onchange = newMatch);
+$('reset').onclick = () => { pending = null; newMatch(); };
+['fmt', 'first'].forEach(id => $(id).onchange = () => { pending = null; newMatch(); });
+// кнопки «справа/слева» — то же, что сказать «справа» или «слева»
+[['boxR', 'R'], ['boxL', 'L']].forEach(([id, box]) => $(id).onclick = () => { st = Q.setBox(st, box); log('нажато: подача ' + Q.side(box)); renderBoard(); });
 
-const PHRASES = ['ноль ноль', 'первый выиграл один ноль', 'второй выиграл переход один один', 'очко мне', 'очко ему', 'yes let', 'переигровка', 'stroke мне', 'stroke ему', 'no let',
-  'семь пять', 'мне три ему девять', 'отмена', 'какой счёт', 'справа', 'следующий гейм'];
+// ввод с клавиатуры: на iPhone диктовка с клавиатуры работает и в режиме «с экрана Домой»
+const sendTyped = () => { const v = $('typed').value.trim(); if (!v) return; $('typed').value = ''; heard(v, null, true, 'введено'); };
+$('send').onclick = sendTyped;
+$('typed').addEventListener('keydown', e => { if (e.key === 'Enter') sendTyped(); });
+
+// последние три — не команды: приложение должно промолчать и ничего не менять
+const PHRASES = ['ноль ноль', 'первый выиграл один ноль', 'второй выиграл переход один один', 'очко мне', 'очко ему', 'yes let', 'переигровка', 'stroke мне', 'stroke ему', 'no let мне', 'ошибка подачи',
+  'семь пять', 'мне три ему девять', 'да', 'нет', 'отмена', 'какой счёт', 'откуда подача', 'справа', 'следующий гейм', 'второй гейм', 'моя ошибка', 'ему тяжело'];
 PHRASES.forEach(p => { const b = document.createElement('button'); b.textContent = p; b.onclick = () => heard(p, null, true); $('chips').append(b); });
 
 $('copy').onclick = () => {
-  const rep = ['Проверка голоса — сквош', new Date().toString(),
+  const rep = ['Проверка голоса — сквош, версия 2', new Date().toString(),
     ...features().map(f => f[0] + ': ' + f[1]),
     'Нажатий на микрофон: ' + stats.pressed + '; распознано фраз: ' + stats.heard + '; включений микрофона: ' + stats.started + '; автоперезапусков: ' + stats.restarts +
       '; самая долгая сессия: ' + stats.longest.toFixed(1) + ' с; режим «постоянно»: ' + ($('cont').checked ? 'да' : 'нет'),
     'Ошибки: ' + (Object.keys(stats.errors).length ? JSON.stringify(stats.errors) : 'нет'),
+    'Сейчас: микрофон ' + (active ? 'включён' : 'выключен') + ', слушать постоянно ' + (want ? 'да' : 'нет') + ', озвучка идёт ' + (speaking ? 'да' : 'нет'),
     '--- журнал ---', ...lines].join('\n');
   const ta = $('report'); ta.value = rep; ta.hidden = false; ta.select();
   const done = () => { $('copy').textContent = 'Скопировано ✓'; setTimeout(() => $('copy').textContent = 'Скопировать отчёт', 2500); };
